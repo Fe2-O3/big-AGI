@@ -4,6 +4,7 @@ import { TRPCError } from '@trpc/server';
 import { createTRPCRouter, publicProcedure } from '~/server/trpc/trpc.server';
 import { env } from '~/server/env.mjs';
 import { fetchJsonOrTRPCThrow } from '~/server/trpc/trpc.router.fetchers';
+import { serverCapitalizeFirstLetter } from '~/server/wire';
 
 import { T2iCreateImageOutput, t2iCreateImagesOutputSchema } from '~/modules/t2i/t2i.server';
 
@@ -13,16 +14,23 @@ import { fixupHost } from '~/common/util/urlUtils';
 import { OpenAIWire_API_Images_Generations, OpenAIWire_API_Models_List, OpenAIWire_API_Moderations_Create } from '~/modules/aix/server/dispatch/wiretypes/openai.wiretypes';
 
 import { ListModelsResponse_schema, ModelDescriptionSchema } from '../llm.server.types';
-import { azureModelToModelDescription, deepseekModelToModelDescription, groqModelSortFn, groqModelToModelDescription, lmStudioModelToModelDescription, localAIModelToModelDescription, openPipeModelDescriptions, openPipeModelSort, openPipeModelToModelDescriptions, openRouterModelFamilySortFn, openRouterModelToModelDescription, togetherAIModelsToModelDescriptions } from './models/models.data';
+import { alibabaModelSort, alibabaModelToModelDescription } from './models/alibaba.models';
+import { azureModelToModelDescription, openAIModelFilter, openAIModelToModelDescription, openAISortModels } from './models/openai.models';
+import { deepseekModelFilter, deepseekModelSort, deepseekModelToModelDescription } from './models/deepseek.models';
+import { fireworksAIHeuristic, fireworksAIModelsToModelDescriptions } from './models/fireworksai.models';
+import { groqModelFilter, groqModelSortFn, groqModelToModelDescription } from './models/groq.models';
+import { lmStudioModelToModelDescription, localAIModelSortFn, localAIModelToModelDescription } from './models/models.data';
 import { mistralModelsSort, mistralModelToModelDescription } from './models/mistral.models';
-import { openAIModelFilter, openAIModelToModelDescription, openAISortModels } from './models/openai.models';
+import { openPipeModelDescriptions, openPipeModelSort, openPipeModelToModelDescriptions } from './models/openpipe.models';
+import { openRouterModelFamilySortFn, openRouterModelToModelDescription } from './models/openrouter.models';
 import { perplexityAIModelDescriptions, perplexityAIModelSort } from './models/perplexity.models';
+import { togetherAIModelsToModelDescriptions } from './models/together.models';
 import { wilreLocalAIModelsApplyOutputSchema, wireLocalAIModelsAvailableOutputSchema, wireLocalAIModelsListOutputSchema } from './localai.wiretypes';
 import { xaiModelDescriptions, xaiModelSort } from './models/xai.models';
 
 
 const openAIDialects = z.enum([
-  'azure', 'deepseek', 'groq', 'lmstudio', 'localai', 'mistral', 'openai', 'openpipe', 'openrouter', 'perplexity', 'togetherai', 'xai',
+  'alibaba', 'azure', 'deepseek', 'groq', 'lmstudio', 'localai', 'mistral', 'openai', 'openpipe', 'openrouter', 'perplexity', 'togetherai', 'xai',
 ]);
 export type OpenAIDialects = z.infer<typeof openAIDialects>;
 
@@ -95,7 +103,7 @@ export const llmOpenAIRouter = createTRPCRouter({
             model: z.string(), // the OpenAI model id
             owner: z.enum(['organization-owner']),
             id: z.string(), // the deployment name
-            status: z.enum(['succeeded']),
+            status: z.string(), // relaxed from z.enum(['succeeded']) for #744
             created_at: z.number(),
             updated_at: z.number(),
             object: z.literal('deployment'),
@@ -150,13 +158,22 @@ export const llmOpenAIRouter = createTRPCRouter({
       // every dialect has a different way to enumerate models - we execute the mapping on the server side
       switch (access.dialect) {
 
+        case 'alibaba':
+          models = openAIModels
+            .map(({ id, created }) => alibabaModelToModelDescription(id, created))
+            .sort(alibabaModelSort);
+          break;
+
         case 'deepseek':
           models = openAIModels
-            .map(({ id }) => deepseekModelToModelDescription(id));
+            .filter(({ id }) => deepseekModelFilter(id))
+            .map(({ id }) => deepseekModelToModelDescription(id))
+            .sort(deepseekModelSort);
           break;
 
         case 'groq':
           models = openAIModels
+            .filter(groqModelFilter)
             .map(groqModelToModelDescription)
             .sort(groqModelSortFn);
           break;
@@ -169,7 +186,8 @@ export const llmOpenAIRouter = createTRPCRouter({
         // [LocalAI]: map id to label
         case 'localai':
           models = openAIModels
-            .map(model => localAIModelToModelDescription(model.id));
+            .map(({ id }) => localAIModelToModelDescription(id))
+            .sort(localAIModelSortFn);
           break;
 
         case 'mistral':
@@ -180,6 +198,11 @@ export const llmOpenAIRouter = createTRPCRouter({
 
         // [OpenAI]: chat-only models, custom sort, manual mapping
         case 'openai':
+
+          // [FireworksAI] special case for model enumeration
+          if (fireworksAIHeuristic(access.oaiHost))
+            return { models: fireworksAIModelsToModelDescriptions(openAIModels) };
+
           models = openAIModels
 
             // limit to only 'gpt' and 'non instruct' models
@@ -327,6 +350,7 @@ export const llmOpenAIRouter = createTRPCRouter({
 });
 
 
+const DEFAULT_ALIBABA_HOST = 'https://dashscope-intl.aliyuncs.com/compatible-mode';
 const DEFAULT_HELICONE_OPENAI_HOST = 'oai.hconeai.com';
 const DEFAULT_DEEPSEEK_HOST = 'https://api.deepseek.com';
 const DEFAULT_GROQ_HOST = 'https://api.groq.com/openai';
@@ -341,6 +365,21 @@ const DEFAULT_XAI_HOST = 'https://api.x.ai';
 
 export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | null, apiPath: string): { headers: HeadersInit, url: string } {
   switch (access.dialect) {
+
+    case 'alibaba':
+      const alibabaOaiKey = access.oaiKey || env.ALIBABA_API_KEY || '';
+      const alibabaOaiHost = fixupHost(access.oaiHost || env.ALIBABA_API_HOST || DEFAULT_ALIBABA_HOST, apiPath);
+      if (!alibabaOaiKey || !alibabaOaiHost)
+        throw new Error('Missing Alibaba API Key. Add it on the UI or server side (your deployment).');
+
+      return {
+        headers: {
+          'Authorization': `Bearer ${alibabaOaiKey}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        url: alibabaOaiHost + apiPath,
+      };
 
     case 'azure':
       const azureKey = access.oaiKey || env.AZURE_OPENAI_API_KEY || '';
@@ -390,7 +429,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       let oaiHost = fixupHost(access.oaiHost || env.OPENAI_API_HOST || DEFAULT_OPENAI_HOST, apiPath);
       // warn if no key - only for default (non-overridden) hosts
       if (!oaiKey && oaiHost.indexOf(DEFAULT_OPENAI_HOST) !== -1)
-        throw new Error('Missing OpenAI API Key. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new Error('Missing OpenAI API Key. Add it on the UI or server side (your deployment).');
 
       // [Helicone]
       // We don't change the host (as we do on Anthropic's), as we expect the user to have a custom host.
@@ -480,7 +519,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
     case 'openpipe':
       const openPipeKey = access.oaiKey || env.OPENPIPE_API_KEY || '';
       if (!openPipeKey)
-        throw new Error('Missing OpenPipe API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new Error('Missing OpenPipe API Key or Host. Add it on the UI or server side (your deployment).');
 
       return {
         headers: {
@@ -493,10 +532,20 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       };
 
     case 'openrouter':
-      const orKey = access.oaiKey || env.OPENROUTER_API_KEY || '';
+      let orKey = access.oaiKey || env.OPENROUTER_API_KEY || '';
       const orHost = fixupHost(access.oaiHost || DEFAULT_OPENROUTER_HOST, apiPath);
+
+      // multi-key with random selection
+      if (orKey.includes(',')) {
+        const multiKeys = orKey
+          .split(',')
+          .map(key => key.trim())
+          .filter(Boolean);
+        orKey = multiKeys[Math.floor(Math.random() * multiKeys.length)];
+      }
+
       if (!orKey || !orHost)
-        throw new Error('Missing OpenRouter API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new Error('Missing OpenRouter API Key or Host. Add it on the UI or server side (your deployment).');
 
       return {
         headers: {
@@ -561,10 +610,10 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
 
 async function openaiGETOrThrow<TOut extends object>(access: OpenAIAccessSchema, apiPath: string /*, signal?: AbortSignal*/): Promise<TOut> {
   const { headers, url } = openAIAccess(access, null, apiPath);
-  return await fetchJsonOrTRPCThrow<TOut>({ url, headers, name: `OpenAI/${access.dialect}` });
+  return await fetchJsonOrTRPCThrow<TOut>({ url, headers, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}` });
 }
 
 async function openaiPOSTOrThrow<TOut extends object, TPostBody extends object>(access: OpenAIAccessSchema, modelRefId: string | null, body: TPostBody, apiPath: string /*, signal?: AbortSignal*/): Promise<TOut> {
   const { headers, url } = openAIAccess(access, modelRefId, apiPath);
-  return await fetchJsonOrTRPCThrow<TOut, TPostBody>({ url, method: 'POST', headers, body, name: `OpenAI/${access.dialect}` });
+  return await fetchJsonOrTRPCThrow<TOut, TPostBody>({ url, method: 'POST', headers, body, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}` });
 }

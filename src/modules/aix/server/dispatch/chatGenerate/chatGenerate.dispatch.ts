@@ -37,7 +37,7 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
     case 'anthropic':
       return {
         request: {
-          ...anthropicAccess(access, '/v1/messages'),
+          ...anthropicAccess(access, model.id, '/v1/messages'),
           body: aixToAnthropicMessageCreate(model, chatGenerate, streaming),
         },
         demuxerFormat: streaming ? 'sse' : null,
@@ -47,7 +47,7 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
     case 'gemini':
       return {
         request: {
-          ...geminiAccess(access, model.id, streaming ? GeminiWire_API_Generate_Content.streamingPostPath : GeminiWire_API_Generate_Content.postPath),
+          ...geminiAccess(access, model.id, streaming ? GeminiWire_API_Generate_Content.streamingPostPath : GeminiWire_API_Generate_Content.postPath, !!model.vndGeminiShowThoughts),
           body: aixToGeminiGenerateContent(model, chatGenerate, access.minSafetyLevel, false, streaming),
         },
         demuxerFormat: streaming ? 'sse' : null,
@@ -74,6 +74,7 @@ export function createChatGenerateDispatch(access: AixAPI_Access, model: AixAPI_
         chatGenerateParse: streaming ? createOpenAIChatCompletionsChunkParser() : createOpenAIChatCompletionsParserNS(),
       };
 
+    case 'alibaba':
     case 'azure':
     case 'deepseek':
     case 'groq':
